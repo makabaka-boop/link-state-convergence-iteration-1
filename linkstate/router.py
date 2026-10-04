@@ -35,6 +35,8 @@ class Router:
         self.id = router_id
         # 本地直连链路的当前配置（邻居 -> 费用），仅用于签发自身 LSA
         self._links: Dict[str, int] = {}
+        # 本地过境资格（False = 排空中，不允许他人经我中转），随 LSA 宣告
+        self._transit = True
         self._seq = 0
         # 链路状态库：origin -> LSAEntry
         self.lsdb: Dict[str, LSAEntry] = {}
@@ -54,12 +56,23 @@ class Router:
     def links(self) -> Dict[str, int]:
         return dict(self._links)
 
+    # ---- 过境资格（维护排空） ------------------------------------------
+
+    def set_transit(self, allowed: bool) -> None:
+        """设置本地过境资格；下一次 :meth:`originate` 随新序号宣告。"""
+        self._transit = bool(allowed)
+
+    @property
+    def transit(self) -> bool:
+        return self._transit
+
     # ---- 签发通告 -----------------------------------------------------
 
     def originate(self, tick: int = 0) -> LSA:
-        """链路变化时调用：序号严格递增，并通告当前链路的完整快照。"""
+        """链路或过境资格变化时调用：序号严格递增，并通告当前链路
+        完整快照与当前过境资格。"""
         self._seq += 1
-        lsa = LSA(self.id, self._seq, dict(self._links))
+        lsa = LSA(self.id, self._seq, dict(self._links), transit=self._transit)
         self.lsdb[self.id] = LSAEntry(lsa, heard_at={self.id: tick})
         return lsa
 
@@ -82,7 +95,7 @@ class Router:
             if lsa.seq < old.lsa.seq:
                 return "stale"
             if lsa.seq == old.lsa.seq:
-                if lsa.links != old.lsa.links:
+                if not lsa.same_content(old.lsa):
                     return "stale"
                 old.heard_at[neighbor] = tick
                 return "dup"

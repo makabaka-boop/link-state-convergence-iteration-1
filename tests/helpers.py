@@ -9,7 +9,11 @@ from typing import Dict, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from linkstate.network import Network  # noqa: E402
-from tests.reference import reference_routes, brute_force_routes  # noqa: E402
+from tests.reference import (  # noqa: E402
+    brute_force_routes,
+    reference_routes,
+    transit_graph,
+)
 
 RouteT = Tuple[Optional[str], int, Tuple[str, ...]]
 
@@ -29,6 +33,7 @@ def assert_routes_match_truth(
     nw: Network,
     *,
     reachable_only: bool = False,
+    drained: Optional[set] = None,
     msg: str = "",
 ) -> None:
     """每个路由器只凭自身 LSDB 的结果，必须与独立参照在“活动拓扑真值”
@@ -36,13 +41,15 @@ def assert_routes_match_truth(
 
     分区后两侧各自只应“知道”本侧节点，所以默认对照节点集取
     各路由器路由表里实际出现的节点；``reachable_only`` 进一步
-    只比较可达项。
+    只比较可达项。``drained`` 给出当前处于过境排空的节点集合，
+    参照侧用独立的“删点”实现 (:func:`transit_graph`) 计算期望。
     """
     truth = nw.truth_graph()
     nodes = sorted(nw.routers)
+    drained = drained or set()
     for rid in nodes:
         # 真值侧：以网络活动拓扑计算（真值知道全部节点，含不可达）
-        expected_full = reference_routes(rid, truth, nodes)
+        expected_full = reference_routes(rid, transit_graph(truth, rid, drained), nodes)
         actual = route_view(nw)[rid]
         for dest in sorted(actual):
             exp = expected_full[dest]

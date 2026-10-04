@@ -430,9 +430,29 @@ class TestDemoScenario(unittest.TestCase):
         )
 
         # 重连且停丢后（tick22 起）收敛并保持稳定
-        for t in range(22, 31):
+        for t in (22, 23):
             r1_routes = {r["dest"]: r for r in recs[t]["routers"]["R1"]["routes"]}
             # R1->R2 应走 R4-R3（费用 7），不再走涨价后的直连
+            self.assertEqual(r1_routes["R2"]["cost"], 7)
+            self.assertEqual(r1_routes["R2"]["next_hop"], "R4")
+
+        # 过境排空窗口（tick24 排空 R3 ~ tick27 撤销）：
+        # R3 不得作为中间点——R1->R2 只剩涨价后的直连（费用 8）；
+        # R3 仍是目的地，但过境资格被排空，显式不可达；
+        # R3 自身作为起点不受影响，仍按最优选路。
+        for t in (24, 25, 26):
+            r1_routes = {r["dest"]: r for r in recs[t]["routers"]["R1"]["routes"]}
+            self.assertEqual(r1_routes["R2"]["cost"], 8)
+            self.assertEqual(r1_routes["R2"]["next_hop"], "R2")
+            self.assertIsNone(r1_routes["R3"]["next_hop"])
+            self.assertEqual(r1_routes["R3"]["cost"], -1)
+            r3_routes = {r["dest"]: r for r in recs[t]["routers"]["R3"]["routes"]}
+            self.assertEqual(r3_routes["R1"]["cost"], 5)
+            self.assertEqual(r3_routes["R1"]["next_hop"], "R4")
+
+        # 撤销排空后（tick27 起）恢复按费用与字典序的最优选路
+        for t in range(27, 31):
+            r1_routes = {r["dest"]: r for r in recs[t]["routers"]["R1"]["routes"]}
             self.assertEqual(r1_routes["R2"]["cost"], 7)
             self.assertEqual(r1_routes["R2"]["next_hop"], "R4")
 

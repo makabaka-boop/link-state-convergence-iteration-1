@@ -2,7 +2,7 @@
 
 每个 tick 依次执行：
   1. 处理本 tick 的外部事件（涨价 / 切断 / 恢复 / 注入过期通告 /
-     设置丢弃概率窗口）；
+     过境排空与撤销 / 设置丢弃概率窗口）；
   2. 周期性补发：各路由器把当前 LSDB 的全部已知通告发给每个
      活动邻居（消息可能丢失时收敛的最终保障）；
   3. 传输层投递所有到期消息，接收端决定 new / dup / stale，
@@ -10,7 +10,9 @@
   4. 生成快照：逐消息日志、各节点 LSDB 与路由表。
 
 网络真值（活动拓扑）只被传输层与事件层使用；路由器计算路由时
-只能访问自己的 LSDB。
+只能访问自己的 LSDB。过境排空也没有全局标志：事件只改变目标
+路由器本地状态并触发它签发更高序号的 LSA，其余节点仅凭收到的
+通告裁决。
 """
 
 from __future__ import annotations
@@ -155,6 +157,29 @@ class Network:
         costs = {(a, b): cost} if cost is not None else None
         return self.restore_set(tick, [(a, b)], costs)
 
+    # ---- 事件：过境排空（可撤销） --------------------------------------
+
+    def set_transit(self, tick: int, rid: str, allowed: bool) -> str:
+        """过境排空事件：目标路由器在本地切换过境资格，并以递增序号
+        签发新 LSA 宣告；不存在任何网络级全局维护标志。
+
+        * ``allowed=False``（排空）：其他节点算路时不得把它作为路径
+          中间点，但仍可把它作为目的地；它自己作为起点不受影响；
+        * ``allowed=True``（撤销排空）：恢复按费用与完整路径字典序
+          的正常选路。
+
+        事件是原子的：本地标志与签发一步完成，要么整体生效、要么
+        整体不生效，不会产生“改了标志却没发通告”的中间状态。
+        """
+        if rid not in self.routers:
+            raise ValueError(f"未知路由器: {rid}")
+        r = self.routers[rid]
+        r.set_transit(allowed)
+        lsa = self._originate(tick, rid)
+        if allowed:
+            return f"undrain {rid}（恢复过境，{lsa.describe()}）"
+        return f"drain {rid}（排空过境，{lsa.describe()}）"
+
     def inject_lsa(
         self,
         tick: int,
@@ -272,6 +297,10 @@ class Network:
             return self.cut_set(t, ev["links"])
         if typ == "restore_set":
             return self.restore_set(t, ev["links"])
+        if typ == "drain":
+            return self.set_transit(t, ev["router"], False)
+        if typ == "undrain":
+            return self.set_transit(t, ev["router"], True)
         if typ == "inject":
             return self.inject_lsa(
                 t,

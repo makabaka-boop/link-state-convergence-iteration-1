@@ -13,6 +13,10 @@
 
 路由器只能拿到自己 LSDB 里的信息——分区中对端节点完全缺失时，
 它既不会出现在图里，也不会得到任何路由（上层标记为不可达）。
+
+过境排空（``transit=False``）的节点不会被用作路径中间点：
+建图时删去所有指向它的边；它仍保留在节点集中作为目的地
+（得到显式不可达表项），源点自身排空时其出边不受限制。
 """
 
 from __future__ import annotations
@@ -38,7 +42,9 @@ class Route:
         }
 
 
-def _build_graph(lsdb: Dict[str, "LSA"]) -> Dict[str, Dict[str, int]]:
+def _build_graph(
+    lsdb: Dict[str, "LSA"], source: Optional[str] = None
+) -> Dict[str, Dict[str, int]]:
     """从 LSDB 重建无向图：只有两端互相声明（且费用一致）的边才有效。
 
     为什么必须双向确认——网络分区时，一侧路由器可能长期持有对侧
@@ -46,11 +52,23 @@ def _build_graph(lsdb: Dict[str, "LSA"]) -> Dict[str, Dict[str, int]]:
     保证：任一端的新 LSA 删除该边后，该边立即失效，旧副本无法
     凭空拼出跨越分区的幽灵路径。调用方传入的 ``lsdb`` 只包含
     老化闭包内仍新鲜的条目。
+
+    过境排空：凡 ``transit`` 为 False 的节点，删去所有**指向它**的
+    边，使它无法成为任何路径的中间点；但它仍作为目的地保留在图中
+    （``dijkstra`` 会为它生成显式不可达表项），且当 ``source`` 本身
+    正在排空时，其**出边**完整保留——宣告者作为起点不受限制。
     """
     graph: Dict[str, Dict[str, int]] = {origin: {} for origin in lsdb}
     for origin, lsa in lsdb.items():
+        if source is not None and origin != source and not lsa.transit:
+            # 排空节点不接受任何进入边：既不能中转，也不再被当作
+            # 普通目的地算路（仍会得到显式不可达表项）。
+            continue
         for neighbor, cost in lsa.links.items():
             if neighbor not in lsdb:
+                continue
+            if source is not None and neighbor != source \
+                    and not lsdb[neighbor].transit:
                 continue
             remote = lsdb[neighbor].links.get(origin)
             if remote is not None and remote == cost:
@@ -109,7 +127,8 @@ def compute_routes(
 
     ``lsdb`` 只含仍新鲜的条目；``all_known`` 为路由器知道存在的
     全部节点（含已老化/不可达），这些节点会得到显式不可达表项。
+    过境资格按各 LSA 的 ``transit`` 标志裁决（见 :func:`_build_graph`）。
     """
-    graph = _build_graph(lsdb)
+    graph = _build_graph(lsdb, source)
     nodes = all_known if all_known is not None else sorted(lsdb)
     return dijkstra(source, graph, nodes)

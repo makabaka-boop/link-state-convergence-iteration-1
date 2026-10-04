@@ -1,5 +1,6 @@
-"""命令行演示：构造一个含涨价、分区、重连、过期通告的场景，
-逐 tick 输出消息日志、各节点 LSDB 与路由表。
+"""命令行演示：构造一个含涨价、分区、重连、过期通告、过境排空
+（维护演练）与撤销排空的场景，逐 tick 输出消息日志、各节点 LSDB
+与路由表。
 
 用法：
     python -m linkstate.cli                 # 文本输出（精简）
@@ -81,13 +82,20 @@ def build_scenario() -> tuple:
             ],
         },
         {"tick": 20, "type": "drop_window", "start": 20, "end": 10_000, "prob": 0.0},
+        # 维护演练：R3 排空过境——其他节点仍把 R3 当目的地，但不再
+        # 经它中转到第三台设备（R1->R2 的 R4-R3-R2 路径将改道）；
+        # 排空以 R3 自己签发的递增序号 LSA 宣告，可撤销。
+        {"tick": 24, "type": "drain", "router": "R3"},
+        # 撤销排空：恢复按费用与完整路径字典序的正常选路
+        {"tick": 27, "type": "undrain", "router": "R3"},
     ]
     return nw, events
 
 
 def _fmt_lsa(lsa: dict) -> str:
     links = ",".join(f"{k}:{v}" for k, v in lsa["links"].items())
-    return f"{lsa['origin']}#{lsa['seq']}({links})"
+    tag = "" if lsa.get("transit", True) else " [排空]"
+    return f"{lsa['origin']}#{lsa['seq']}({links}){tag}"
 
 
 def _fmt_route(rt: dict) -> str:
