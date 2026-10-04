@@ -51,6 +51,10 @@ class Network:
         # 已排队但尚未执行的事件（多次调用 run 时持续保留）
         self._pending_events: List[dict] = []
 
+    def _require_router(self, rid: str) -> None:
+        if rid not in self.routers:
+            raise ValueError(f"未知路由器 {rid}")
+
     # ---- 拓扑搭建（boot 之前） ----------------------------------------
 
     def add_router(self, router_id: str) -> None:
@@ -94,6 +98,42 @@ class Network:
             g[a][b] = rec["cost"]
             g[b][a] = rec["cost"]
         return g
+
+    def truth_drained(self) -> set:
+        """当前已宣告过境排空的节点集合（仅供测试核对；路由器算路
+        时只能依据各自 LSDB 中随 LSA 泛洪来的 transit 位，不读本集
+        合）。"""
+        return {rid for rid, r in self.routers.items() if not r.transit}
+
+    # ---- 事件：过境排空 / 撤销 ----------------------------------------
+
+    def drain_router(self, tick: int, rid: str) -> str:
+        """让 ``rid`` 在本地 LSA 中以递增序号宣告过境排空。
+
+        非法调用（未知节点、重复排空）在 Router 内修改任何状态前
+        抛出，因此通告不会签发、消息不会发送、轨迹不会记录。
+        """
+        self._require_router(rid)
+        r = self.routers[rid]
+        if not r.transit:
+            # 与 Router.drain 的守卫保持一致，保证网络层也无副作用
+            raise ValueError(f"路由器 {rid} 已处于排空状态，不能重复排空")
+        lsa = r.drain(tick)
+        for nb in self.active_neighbors(rid):
+            self.transport.send(tick, rid, nb, lsa)
+        return f"drain {rid}（过境排空：可达为目的地，但禁止中转）"
+
+    def undrain_router(self, tick: int, rid: str) -> str:
+        """撤销 ``rid`` 的过境排空，恢复其中转资格。非法（未排空
+        却撤销）时同样无任何副作用。"""
+        self._require_router(rid)
+        r = self.routers[rid]
+        if r.transit:
+            raise ValueError(f"路由器 {rid} 当前未排空，不能撤销排空")
+        lsa = r.undrain(tick)
+        for nb in self.active_neighbors(rid):
+            self.transport.send(tick, rid, nb, lsa)
+        return f"undrain {rid}（撤销排空：恢复过境资格）"
 
     # ---- 事件：链路变化与通告注入 -------------------------------------
 
@@ -162,15 +202,18 @@ class Network:
         seq: int,
         links: Dict[str, int],
         *,
+        transit: bool = True,
         src: Optional[str] = None,
         deliver_now: bool = False,
     ) -> str:
         """注入一条“外部到达”的通告（测试过期通告用）。
 
         默认经传输层送达（可被延迟/丢弃）；``deliver_now`` 时
-        立即交给目标路由器裁决。
+        立即交给目标路由器裁决。``transit`` 可伪造过境资格位，
+        用于验证旧序号/同序号异内容（含排空位被篡改）的通告
+        不能恢复旧资格。
         """
-        lsa = LSA(origin, seq, dict(links))
+        lsa = LSA(origin, seq, dict(links), transit)
         target = src or origin
         if deliver_now:
             result = self.routers[target].receive(lsa, tick)
@@ -204,8 +247,16 @@ class Network:
         lsa = msg["lsa"]
         if lsa.origin == r.id:
             # 自己签发的通告绕了一圈回来：只能是旧序号或完全相同，
-            # 照常走裁决逻辑（旧序号拒绝），不转发。
-            result = "stale" if lsa.seq < r.current_seq else "dup"
+            # 照常走裁决逻辑（旧序号/同序号异内容拒绝），不转发。
+            if lsa.seq < r.current_seq:
+                result = "stale"
+            elif (
+                lsa.seq == r.current_seq
+                and lsa.content_key() == r.lsdb[r.id].lsa.content_key()
+            ):
+                result = "dup"
+            else:
+                result = "stale"
         else:
             result = r.receive(lsa, tick, neighbor=msg["src"])
         self._log_message(tick, "deliver", msg, result=result)
@@ -272,12 +323,17 @@ class Network:
             return self.cut_set(t, ev["links"])
         if typ == "restore_set":
             return self.restore_set(t, ev["links"])
+        if typ == "drain":
+            return self.drain_router(t, ev["router"])
+        if typ == "undrain":
+            return self.undrain_router(t, ev["router"])
         if typ == "inject":
             return self.inject_lsa(
                 t,
                 ev["origin"],
                 ev["seq"],
                 ev.get("links", {}),
+                transit=ev.get("transit", True),
                 src=ev.get("src"),
                 deliver_now=ev.get("deliver_now", False),
             )
@@ -337,9 +393,15 @@ class Network:
             self._boots_done = True
             self.tick = 0
             # boot tick 上可能已排队 tick0 事件
-            while self._pending_events and self._pending_events[0]["tick"] == 0:
-                ev = self._pending_events.pop(0)
-                self._records[-1]["events"].append(self._process_event(ev))
+            try:
+                while self._pending_events and self._pending_events[0]["tick"] == 0:
+                    ev = self._pending_events.pop(0)
+                    self._records[-1]["events"].append(self._process_event(ev))
+            except Exception:
+                # 非法事件不得在轨迹中留下“执行了一半”的 tick：
+                # 此时该 tick 尚未投递任何消息，整条记录回滚。
+                self._records.pop()
+                raise
             self.transport.deliver_due(0)
             self._records[-1].update(self._snapshot())
             first_tick = 1
@@ -351,10 +413,16 @@ class Network:
             self._records.append({"tick": t, "events": [], "messages": []})
 
             # 1. 外部事件（含 boot tick 上排队的 tick0 事件）
-            while self._pending_events and self._pending_events[0]["tick"] == t:
-                ev = self._pending_events.pop(0)
-                desc = self._process_event(ev)
-                self._records[-1]["events"].append(desc)
+            try:
+                while self._pending_events and self._pending_events[0]["tick"] == t:
+                    ev = self._pending_events.pop(0)
+                    desc = self._process_event(ev)
+                    self._records[-1]["events"].append(desc)
+            except Exception:
+                # 事件非法时：它在产生任何通告/消息之前即已拒绝，
+                # 回滚本 tick 尚为空的记录，不留部分轨迹。
+                self._records.pop()
+                raise
 
             # 2. 周期性补发（boot 那 tick 已全量首发，从下一周期开始）
             if t > 0 and t % self.refresh_interval == 0:

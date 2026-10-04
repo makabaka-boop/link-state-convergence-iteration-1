@@ -85,9 +85,25 @@ def build_scenario() -> tuple:
     return nw, events
 
 
+def build_drain_scenario() -> tuple:
+    """过境排空专用演示：6 节点环 + 弦，中途维护 R3，随后撤销。
+
+    拓扑与 :func:`build_scenario` 相同，默认演示仍保持旧输出不变；
+    本场景用 ``--drain-demo`` 触发，展示：排空 R3 后全网仍能到达
+    R3，但所有路径不再以 R3 为中间点；撤销后恢复最短路。
+    """
+    nw, events = build_scenario()
+    events = events + [
+        {"tick": 24, "type": "drain", "router": "R3"},
+        {"tick": 28, "type": "undrain", "router": "R3"},
+    ]
+    return nw, events
+
+
 def _fmt_lsa(lsa: dict) -> str:
     links = ",".join(f"{k}:{v}" for k, v in lsa["links"].items())
-    return f"{lsa['origin']}#{lsa['seq']}({links})"
+    suffix = "" if lsa.get("transit", True) else ",!transit"
+    return f"{lsa['origin']}#{lsa['seq']}({links}{suffix})"
 
 
 def _fmt_route(rt: dict) -> str:
@@ -159,10 +175,18 @@ def main(argv: list | None = None) -> None:
     parser = argparse.ArgumentParser(description="链路状态路由模拟器")
     parser.add_argument("--ticks", type=int, default=30)
     parser.add_argument("--verbose", action="store_true", help="打印每条消息")
+    parser.add_argument(
+        "--drain-demo",
+        action="store_true",
+        help="运行过境排空演示（tick24 排空 R3，tick28 撤销）",
+    )
     parser.add_argument("--json", dest="json_path", help="导出完整 JSON 记录")
     args = parser.parse_args(argv)
 
-    nw, events = build_scenario()
+    if args.drain_demo:
+        nw, events = build_drain_scenario()
+    else:
+        nw, events = build_scenario()
     records = nw.run(args.ticks, events)
 
     if args.json_path:

@@ -35,6 +35,8 @@ class Router:
         self.id = router_id
         # 本地直连链路的当前配置（邻居 -> 费用），仅用于签发自身 LSA
         self._links: Dict[str, int] = {}
+        # 本地过境资格：False 表示正在维护（排空），只可作为目的地
+        self._transit = True
         self._seq = 0
         # 链路状态库：origin -> LSAEntry
         self.lsdb: Dict[str, LSAEntry] = {}
@@ -54,12 +56,41 @@ class Router:
     def links(self) -> Dict[str, int]:
         return dict(self._links)
 
+    # ---- 过境排空（可撤销） ------------------------------------------
+
+    def drain(self, tick: int = 0) -> LSA:
+        """宣告本节点进入过境排空：可作为目的地与起点，但不得被
+        其它节点的路径借作中转。签发一条序号递增的新 LSA。
+
+        已处于排空状态时再次排空属于非法事件：在修改任何状态前
+        抛出异常，通告与轨迹均不发生部分更新。
+        """
+        if not self._transit:
+            raise ValueError(f"路由器 {self.id} 已处于排空状态，不能重复排空")
+        self._transit = False
+        return self.originate(tick)
+
+    def undrain(self, tick: int = 0) -> LSA:
+        """撤销排空：恢复过境资格，重新可作为路径中间点。
+
+        当前并未排空时撤销同样属于非法事件，先抛错、不留痕迹。
+        """
+        if self._transit:
+            raise ValueError(f"路由器 {self.id} 当前未排空，不能撤销排空")
+        self._transit = True
+        return self.originate(tick)
+
+    @property
+    def transit(self) -> bool:
+        return self._transit
+
     # ---- 签发通告 -----------------------------------------------------
 
     def originate(self, tick: int = 0) -> LSA:
-        """链路变化时调用：序号严格递增，并通告当前链路的完整快照。"""
+        """链路变化时调用：序号严格递增，并通告当前链路的完整快照
+        与当前过境资格。"""
         self._seq += 1
-        lsa = LSA(self.id, self._seq, dict(self._links))
+        lsa = LSA(self.id, self._seq, dict(self._links), self._transit)
         self.lsdb[self.id] = LSAEntry(lsa, heard_at={self.id: tick})
         return lsa
 
@@ -73,8 +104,9 @@ class Router:
         """处理从 ``neighbor`` 到达的通告，返回处置结果：
 
         "new"   —— 首次见到或序号更新：记录，并记下从该邻居听到；
-        "stale" —— 旧序号或同序号内容冲突：拒绝，绝不覆盖新状态，
-                   也不刷新任何听到时间；
+        "stale" —— 旧序号或同序号内容冲突（链路快照或过境资格
+                   任一不一致）：拒绝，绝不覆盖新状态，也不刷新
+                   任何听到时间；
         "dup"   —— 完全相同：只刷新从该邻居听到的时间。
         """
         old = self.lsdb.get(lsa.origin)
@@ -82,7 +114,7 @@ class Router:
             if lsa.seq < old.lsa.seq:
                 return "stale"
             if lsa.seq == old.lsa.seq:
-                if lsa.links != old.lsa.links:
+                if lsa.content_key() != old.lsa.content_key():
                     return "stale"
                 old.heard_at[neighbor] = tick
                 return "dup"
